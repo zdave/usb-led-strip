@@ -1,4 +1,5 @@
 #include <avr/io.h>
+#include "ports.h"
 #include "usbconfig.h"
 
     tmp = 0
@@ -42,18 +43,18 @@ ws2812b_write:
     // 0: 4cyc ~= 0.33us high (~0.07us short), 10cyc ~= 0.83us low (~0.02us short)
     // 1: 9cyc ~= 0.75us high (~0.05us short), 5cyc ~= 0.42us low (~0.03us short)
 0:
-    out _SFR_IO_ADDR(PORTD), high   // 0
-    nop                             // 1
-    ld tmp, x+                      // 2, 3
-    out _SFR_IO_ADDR(PORTD), tmp    // 4
-    nop                             // 5
-    nop                             // 6
-    nop                             // 7
-    cp endl, xl                     // 8
-    out _SFR_IO_ADDR(PORTD), zero   // 9
-    cpc endh, xh                    // 10
+    out _SFR_IO_ADDR(WS2812B_PORT), high    // 0
+    nop                                     // 1
+    ld tmp, x+                              // 2, 3
+    out _SFR_IO_ADDR(WS2812B_PORT), tmp     // 4
+    nop                                     // 5
+    nop                                     // 6
+    nop                                     // 7
+    cp endl, xl                             // 8
+    out _SFR_IO_ADDR(WS2812B_PORT), zero    // 9
+    cpc endh, xh                            // 10
     sbis _SFR_IO_ADDR(USB_INTR_PENDING), USB_INTR_PENDING_BIT // 11
-    brne 0b                         // 12, 13
+    brne 0b                                 // 12, 13
 
     sei
 
