@@ -1,0 +1,77 @@
+#!/usr/bin/env python3
+
+import os
+import shlex
+
+import ninja_syntax
+
+gcc_flags = '-mmcu=atmega88 -DF_CPU=12000000ul -Wall -Werror -Os'
+avrdude_flags = '-c usbasp -p ATmega88'
+
+srcs = [
+    'main.c',
+    'ws2812b.S',
+    'v-usb/usbdrv/oddebug.c',
+    'v-usb/usbdrv/usbdrv.c',
+    'v-usb/usbdrv/usbdrvasm.S']
+include_dirs = [
+    'usbconfig',
+    'v-usb/usbdrv']
+
+fuses = {
+    'lfuse': '0xe7',
+    'hfuse': '0xdf',
+    'efuse': '0xf9'}
+
+esc = ninja_syntax.escape
+
+def esc_list(xs):
+    return [esc(x) for x in xs]
+
+gen_ninja = os.path.realpath(__file__)
+fw_dir = os.path.dirname(gen_ninja)
+
+def abs(path):
+    return os.path.join(fw_dir, path)
+
+def main():
+    with open('build.ninja', 'w') as f:
+        w = ninja_syntax.Writer(f)
+
+        w.variable('gcc_flags', esc(gcc_flags))
+        w.variable('avrdude_flags', esc(avrdude_flags))
+
+        w.build('__always__', 'phony')
+
+        w.rule('gen', '$in', generator=True)
+        w.build('build.ninja', 'gen', esc(gen_ninja))
+
+        include_dir_flags = ' '.join(shlex.quote('-I' + abs(include_dir)) for include_dir in include_dirs)
+        w.rule('compile', f'avr-gcc $gcc_flags {esc(include_dir_flags)} -MD -MF $depfile -c $in -o $out', depfile='$out.d')
+        objs = []
+        for src in srcs:
+            obj = os.path.splitext(os.path.basename(src))[0] + '.o'
+            w.build(esc(obj), 'compile', esc(abs(src)))
+            objs.append(obj)
+
+        w.rule('link', 'avr-gcc $gcc_flags $in -o $out')
+        w.build('fw', 'link', esc_list(objs))
+
+        w.rule('hex', 'avr-objcopy -O ihex $in $out')
+        w.build('fw.hex', 'hex', 'fw')
+
+        # Console pool on avrdude rules also prevents multiple steps trying to
+        # fiddle with device at the same time!
+
+        w.rule('flash', 'avrdude $avrdude_flags -U flash:w:$in:i', pool='console')
+        w.build('flash', 'flash', 'fw.hex', implicit='__always__')
+
+        w.rule('fuse', 'avrdude $avrdude_flags -U $out:w:$value:m', pool='console')
+        for fuse, value in fuses.items():
+            w.build(esc(fuse), 'fuse', variables={'value': esc(value)}, implicit='__always__')
+        w.build('fuses', 'phony', esc_list(fuses))
+
+        # By default, just compile and link
+        w.default('fw')
+
+main()
