@@ -1,0 +1,196 @@
+#!/usr/bin/env python3
+
+import enum
+import struct
+import sys
+
+class VcdWriter:
+    def __init__(self, f):
+        self.__f = f
+        self.__started = False
+        self.__vars = {} # Map from ident to var
+        self.__time_ns = 0
+        self.__values = {} # Map from ident to current value
+        self.__written_values = {}
+
+    def map(self, ident, var):
+        assert not self.__started
+        assert ident not in self.__vars
+        self.__vars[ident] = var
+
+    def __line(self, line):
+        self.__f.write(line)
+        self.__f.write('\n')
+
+    def start(self):
+        assert not self.__started
+        self.__started = True
+
+        self.__line('$timescale 1 ns $end')
+
+        self.__line('$scope module logic $end')
+        for ident, var in self.__vars.items():
+            self.__line(f'$var wire 1 {ident} {var} $end')
+        self.__line('$upscope $end')
+
+        self.__line('$enddefinitions $end')
+
+    def wait_us(self, us):
+        assert self.__started
+
+        if self.__values != self.__written_values:
+            self.__line(f'#{self.__time_ns}')
+            for ident, value in self.__values.items():
+                self.__line(f'{value:d}{ident}')
+            self.__written_values = dict(self.__values)
+
+        self.__time_ns += round(us * 1000)
+
+    def wait_ms(self, ms):
+        self.wait_us(ms * 1000)
+
+    def __getitem__(self, ident):
+        return self.__values[ident]
+
+    def __setitem__(self, ident, value):
+        assert ident in self.__vars
+        self.__values[ident] = value
+
+class UsbState(enum.Enum):
+    SE0 = 0
+    J = 1
+    K = 2
+
+def to_bits(n, num_bits):
+    bits = []
+    for i in range(num_bits):
+        bits.append(bool(n & 1))
+        n >>= 1
+    assert n == 0
+    return bits
+
+class Usb:
+    def __init__(self, vcd_writer):
+        vcd_writer.map('-', 'iogC_4')
+        vcd_writer.map('+', 'iogC_5')
+        self.__w = vcd_writer
+        self.__set_state(UsbState.J) # Idle
+        # self.__consec_ones first set by __start()
+        self.__data1_next = False
+
+    def __set_state(self, state):
+        # Low speed...
+        self.__w['-'] = state == UsbState.J
+        self.__w['+'] = state == UsbState.K
+
+    def __state(self):
+        if self.__w['-']:
+            assert not self.__w['+']
+            return UsbState.J
+        return UsbState.K if self.__w['+'] else UsbState.SE0
+
+    def __wait_cycles(self, num):
+        self.__w.wait_us(num / 1.5) # 1.5MHz
+
+    def __cycle(self, state):
+        self.__set_state(state)
+        self.__wait_cycles(1)
+
+    def __start(self):
+        for i in range(3):
+            self.__cycle(UsbState.K)
+            self.__cycle(UsbState.J)
+        self.__cycle(UsbState.K)
+        self.__cycle(UsbState.K)
+        self.__consec_ones = 1 # The "one" that ends the sync pattern counts
+
+    def __end(self):
+        self.__cycle(UsbState.SE0)
+        self.__cycle(UsbState.SE0)
+        self.__set_state(UsbState.J) # Idle
+
+    def __bit(self, bit):
+        if not bit:
+            self.__set_state({
+                UsbState.J: UsbState.K,
+                UsbState.K: UsbState.J}[self.__state()])
+        self.__wait_cycles(1)
+        if bit:
+            self.__consec_ones += 1
+            if self.__consec_ones == 6:
+                self.__bit(False)
+        else:
+            self.__consec_ones = 0
+
+    def __packet(self, bits):
+        self.__start()
+        for bit in bits:
+            self.__bit(bit)
+        self.__end()
+        self.__wait_cycles(2) # Minimum inter-packet delay is 2 cycles
+
+    def __token_packet(self, packet_id, addr, endpoint):
+        self.__packet(
+            to_bits(packet_id, 8) +
+            to_bits(addr, 7) +
+            to_bits(endpoint, 4) +
+            to_bits(0, 5)) # CRC (ignored by v-usb)
+
+    def __setup_packet(self, addr, endpoint):
+        self.__token_packet(0x2d, addr, endpoint)
+        self.__data1_next = False
+
+    def __out_packet(self, addr, endpoint):
+        self.__token_packet(0xe1, addr, endpoint)
+
+    def __data_packet(self, data):
+        bits = to_bits(0x4b if self.__data1_next else 0xc3, 8) # Packet identifier
+        self.__data1_next = not self.__data1_next
+        for byte in data:
+            bits.extend(to_bits(byte, 8))
+        bits.extend(to_bits(0, 16)) # CRC (ignored by v-usb)
+        self.__packet(bits)
+
+    def setup(self, req_type=0, req=0, value=0, index=0, length=0, addr=0, endpoint=0):
+        self.__setup_packet(addr, endpoint)
+        self.__data_packet(struct.pack('<BBHHH', req_type, req, value, index, length))
+        self.__wait_cycles(100) # Leave enough time for v-usb to handle
+
+    def out(self, data, addr=0, endpoint=0):
+        # Low speed: max 8 bytes per data packet
+        for i in range(0, len(data), 8):
+            self.__out_packet(addr, endpoint)
+            self.__data_packet(data[i:i + 8])
+            self.__wait_cycles(100) # Leave enough time for v-usb to handle
+
+class UsbLedStrip:
+    def __init__(self, usb):
+        self.__usb = usb
+
+    def write_buf(self, offset, data):
+        # Max 254 bytes per control transfer
+        for i in range(0, len(data), 254):
+            this_data = data[i:i + 254]
+            self.__usb.setup(req_type=0x40, req=0, index=offset + i, length=len(this_data))
+            self.__usb.out(this_data)
+
+    def update_leds(self):
+        self.__usb.setup(req_type=0x40, req=1)
+
+def main():
+    w = VcdWriter(sys.stdout)
+    usb = Usb(w)
+    strip = UsbLedStrip(usb)
+
+    w.start()
+    w.wait_ms(300) # Wait for USB connect
+    strip.write_buf(0, b'\x01\x02\x03\x04\x05\x06\x07\x08\xff\xfe')
+    strip.update_leds()
+    w.wait_us(100)
+    strip.write_buf(646, b'\xde\xad')
+    w.wait_ms(5)
+    strip.update_leds()
+    w.wait_ms(5)
+    strip.update_leds()
+
+main()

@@ -5,11 +5,14 @@ import shlex
 
 import ninja_syntax
 
-gcc_flags = '-mmcu=atmega88 -DF_CPU=12000000ul -Wall -Werror -Os'
+freq = 12000000
+gcc_flags = f'-mmcu=atmega88 -DF_CPU={freq}ul -Wall -Werror -Os -g'
+simavr_flags = f'-m atmega88 -f {freq}'
 avrdude_flags = '-c usbasp -p ATmega88'
 
 srcs = [
     'main.c',
+    'trace.c',
     'ws2812b.S',
     'v-usb/usbdrv/oddebug.c',
     'v-usb/usbdrv/usbdrv.c',
@@ -39,9 +42,11 @@ def main():
         w = ninja_syntax.Writer(f)
 
         w.variable('gcc_flags', esc(gcc_flags))
+        w.variable('simavr_flags', esc(simavr_flags))
         w.variable('avrdude_flags', esc(avrdude_flags))
 
-        w.build('__always__', 'phony')
+        always = '__always__'
+        w.build(esc(always), 'phony')
 
         w.rule('gen', '$in', generator=True)
         w.build('build.ninja', 'gen', esc(gen_ninja))
@@ -60,15 +65,31 @@ def main():
         w.rule('hex', 'avr-objcopy -O ihex $in $out')
         w.build('fw.hex', 'hex', 'fw')
 
+        gen_input_vcd = abs('gen-input-vcd')
+        w.rule('gen-input-vcd', esc(shlex.quote(gen_input_vcd)) + ' >$out')
+        w.build('input.vcd', 'gen-input-vcd', implicit=esc(gen_input_vcd))
+
+        w.rule('sim', 'simavr $simavr_flags --input $in')
+        w.build('gtkwave_trace.vcd', 'sim', ['input.vcd', 'fw'])
+
+        w.rule('gtkwave', 'gtkwave $in', pool='console')
+        w.build('surf', 'gtkwave', 'gtkwave_trace.vcd', implicit=esc(always))
+
+        w.rule('gdbserver', 'simavr $simavr_flags --gdb --input $in', pool='console')
+        w.build('gdbserver', 'gdbserver', ['input.vcd', 'fw'], implicit=esc(always))
+
+        w.rule('cgdb', 'cgdb -d avr-gdb -- -ex "target remote localhost:1234" $in', pool='console')
+        w.build('cgdb', 'cgdb', 'fw', implicit=esc(always))
+
         # Console pool on avrdude rules also prevents multiple steps trying to
         # fiddle with device at the same time!
 
         w.rule('flash', 'avrdude $avrdude_flags -U flash:w:$in:i', pool='console')
-        w.build('flash', 'flash', 'fw.hex', implicit='__always__')
+        w.build('flash', 'flash', 'fw.hex', implicit=esc(always))
 
         w.rule('fuse', 'avrdude $avrdude_flags -U $out:w:$value:m', pool='console')
         for fuse, value in fuses.items():
-            w.build(esc(fuse), 'fuse', variables={'value': esc(value)}, implicit='__always__')
+            w.build(esc(fuse), 'fuse', variables={'value': esc(value)}, implicit=esc(always))
         w.build('fuses', 'phony', esc_list(fuses))
 
         # By default, just compile and link
